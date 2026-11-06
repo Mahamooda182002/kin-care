@@ -1,0 +1,375 @@
+rules_version = '2';
+
+// Kin Care Connect — Firestore security rules.
+//
+// Principles
+//  • Deny by default. Every collection is listed explicitly.
+//  • Ownership: personal data (summaries, recordings, scam checks, own
+//    reminders, notifications, devices) is readable only by its owner.
+//  • Family membership: membership docs have the deterministic id
+//    `${familyId}_${uid}` so rules can check them with get()/exists().
+//  • Roles: admin | caregiver | viewer | elderly (see Module I).
+//  • Consent: family members see a care profile's activity / medical /
+//    reminders ONLY when that profile's sharingConsent flag is true. Consent
+//    is changed only by the linked elderly account, or by an admin when no
+//    elderly account is linked.
+//  • Server-only writes (invitations, notifications, rate limits) go through
+//    Cloud Functions using the Admin SDK, which bypasses these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function isOwner(userId) { return signedIn() && uid() == userId; }
+
+    function memberPath(familyId) {
+      return /databases/$(database)/documents/familyMembers/$(familyId + '_' + uid());
+    }
+    function isMember(familyId) {
+      return signedIn() && familyId is string && exists(memberPath(familyId))
+        && get(memberPath(familyId)).data.invitationStatus == 'accepted';
+    }
+    function roleIn(familyId, roles) {
+      return isMember(familyId) && get(memberPath(familyId)).data.role in roles;
+    }
+    function isAdmin(familyId) { return roleIn(familyId, ['admin']); }
+
+    function profile(profileId) {
+      return get(/databases/$(database)/documents/careProfiles/$(profileId)).data;
+    }
+    function profileExists(profileId) {
+      return profileId is string && exists(/databases/$(database)/documents/careProfiles/$(profileId));
+    }
+    function consent(profileId, kind) {
+      return profile(profileId).sharingConsent[kind] == true;
+    }
+    function isLinkedElder(profileId) {
+      return signedIn() && profile(profileId).get('linkedUserId', null) == uid();
+    }
+    function isAssignedCaregiver(profileId) {
+      return signedIn() && uid() in profile(profileId).get('caregiverIds', []);
+    }
+    // Admin of the profile's family, or an assigned caregiver who is still a
+    // caregiver/admin member of that family.
+    function canCareFor(profileId) {
+      let fid = profile(profileId).familyId;
+      return isAdmin(fid) || (isAssignedCaregiver(profileId) && roleIn(fid, ['caregiver', 'admin']));
+    }
+
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+    function unchanged(keys) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(keys);
+    }
+    function str(v, max) { return v is string && v.size() > 0 && v.size() <= max; }
+    function optStr(v, max) { return v == null || (v is string && v.size() <= max); }
+
+    // ---------- users ----------
+    // Data minimisation: only these fields may exist on a user document
+    // (see docs/DATA_INVENTORY.md). No phone number, no password, no DOB.
+    function userKeys() {
+      return ['uid', 'fullName', 'email', 'role', 'profileImage',
+              'accessibilitySettings', 'notificationPrefs', 'privacy',
+              'consents', 'monitoring', 'createdAt', 'updatedAt'];
+    }
+    function consentKeys() {
+      return ['termsVersion', 'privacyVersion', 'acceptedAt', 'ageConfirmed',
+              'minimumAge', 'privacyChoices'];
+    }
+    // Consent record: Terms + Privacy version, server timestamp, and the
+    // 18+ confirmation. Written by the owner at registration, or again when
+    // they re-accept new versions; never back-dated, never without 18+.
+    function validConsents(c) {
+      return c is map
+        && c.keys().hasOnly(consentKeys())
+        && c.termsVersion is string && c.termsVersion.size() <= 20
+        && c.privacyVersion is string && c.privacyVersion.size() <= 20
+        && c.acceptedAt == request.time
+        && c.ageConfirmed == true
+        && c.minimumAge == 18
+        && (!('privacyChoices' in c) || (c.privacyChoices is map
+             && c.privacyChoices.keys().hasOnly(['version', 'decidedAt', 'notifications', 'ai'])));
+    }
+    // AI / recording consent flags, stamped with the time of every change.
+    function validPrivacy(p) {
+      return p is map
+        && p.keys().hasOnly(['aiMedicalConsent', 'aiScamConsent', 'recordingConsentAcknowledged', 'policyVersion', 'updatedAt'])
+        && p.aiMedicalConsent is bool && p.aiScamConsent is bool;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(userKeys())
+        && request.resource.data.uid == userId
+        && str(request.resource.data.fullName, 80)
+        && request.resource.data.email == request.auth.token.email.lower()
+        && request.resource.data.role in ['elderly', 'caregiver']
+        && validConsents(request.resource.data.consents)
+        && validPrivacy(request.resource.data.privacy)
+        && request.resource.data.privacy.updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && unchanged(['uid', 'email', 'createdAt'])
+        // Legacy docs may still hold a phone number; it can only be removed.
+        && request.resource.data.keys().hasOnly(userKeys().concat(['phone']))
+        && (!('phone' in request.resource.data)
+            || ('phone' in resource.data && request.resource.data.phone == resource.data.phone))
+        && (unchanged(['consents']) || validConsents(request.resource.data.consents))
+        && (unchanged(['privacy'])
+            || (validPrivacy(request.resource.data.privacy)
+                && request.resource.data.privacy.updatedAt == request.time))
+        && str(request.resource.data.fullName, 80)
+        && request.resource.data.role in ['elderly', 'caregiver'];
+      allow delete: if false; // account deletion runs server-side
+
+      // FCM registration tokens: owner only.
+      match /devices/{deviceId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // ---------- families ----------
+    match /families/{familyId} {
+      allow read: if isMember(familyId);
+      allow create: if signedIn()
+        && request.resource.data.createdBy == uid()
+        && request.resource.data.familyId == familyId
+        && str(request.resource.data.familyName, 60)
+        // The creator's admin membership must be written in the same batch.
+        && getAfter(/databases/$(database)/documents/familyMembers/$(familyId + '_' + uid())).data.role == 'admin';
+      allow update: if isAdmin(familyId) && onlyChanges(['familyName']) && str(request.resource.data.familyName, 60);
+      allow delete: if false; // server-side only (account deletion cleanup)
+    }
+
+    // ---------- family memberships ----------
+    match /familyMembers/{membershipId} {
+      allow read: if signedIn() && (resource.data.userId == uid() || isMember(resource.data.familyId));
+
+      // Only the family creator's own admin membership can be created by a
+      // client (in the same batch as the family). Everyone else joins through
+      // the familyAcceptInvitation function.
+      allow create: if signedIn()
+        && membershipId == request.resource.data.familyId + '_' + uid()
+        && request.resource.data.userId == uid()
+        && request.resource.data.role == 'admin'
+        && request.resource.data.invitationStatus == 'accepted'
+        && !exists(/databases/$(database)/documents/families/$(request.resource.data.familyId))
+        && getAfter(/databases/$(database)/documents/families/$(request.resource.data.familyId)).data.createdBy == uid();
+
+      // Admins change roles/permissions of OTHER members.
+      allow update: if signedIn()
+        && isAdmin(resource.data.familyId)
+        && resource.data.userId != uid()
+        && onlyChanges(['role', 'permissions'])
+        && request.resource.data.role in ['admin', 'caregiver', 'viewer', 'elderly'];
+
+      // Admin removes a member, or a member leaves.
+      allow delete: if signedIn() && (resource.data.userId == uid() || isAdmin(resource.data.familyId));
+    }
+
+    // ---------- invitations (server-managed) ----------
+    match /invitations/{invitationId} {
+      allow read: if signedIn() && (
+        (request.auth.token.email != null && resource.data.inviteeEmail == request.auth.token.email.lower())
+        || isAdmin(resource.data.familyId));
+      allow write: if false;
+    }
+
+    // ---------- care profiles ----------
+    match /careProfiles/{profileId} {
+      allow read: if signedIn() && (isMember(resource.data.familyId) || resource.data.get('linkedUserId', null) == uid());
+
+      allow create: if isAdmin(request.resource.data.familyId)
+        && request.resource.data.createdBy == uid()
+        && str(request.resource.data.displayName, 60)
+        && request.resource.data.linkedUserId == null
+        && request.resource.data.sharingConsent.activity == false
+        && request.resource.data.sharingConsent.medical == false
+        && request.resource.data.sharingConsent.reminders == false;
+
+      allow update: if signedIn() && unchanged(['familyId', 'createdBy', 'createdAt', 'linkedUserId']) && (
+        // Admin edits details and caregiver assignments (not consent).
+        (isAdmin(resource.data.familyId)
+          && onlyChanges(['displayName', 'notes', 'caregiverIds'])
+          && str(request.resource.data.displayName, 60))
+        ||
+        // Consent: the linked elder, or an admin when no elder is linked.
+        (onlyChanges(['sharingConsent', 'consentUpdatedBy', 'consentUpdatedAt'])
+          && request.resource.data.consentUpdatedBy == uid()
+          && (resource.data.get('linkedUserId', null) == uid()
+              || (resource.data.get('linkedUserId', null) == null && isAdmin(resource.data.familyId))))
+      );
+
+      allow delete: if isAdmin(resource.data.familyId);
+    }
+
+    // ---------- activity records ----------
+    match /activityRecords/{recordId} {
+      allow read: if signedIn() && (
+        resource.data.userId == uid()
+        || (resource.data.profileId != null
+            && isMember(resource.data.familyId)
+            && profile(resource.data.profileId).familyId == resource.data.familyId
+            && consent(resource.data.profileId, 'activity')));
+
+      allow create: if signedIn()
+        && request.resource.data.userId == uid()
+        && request.resource.data.activityType in ['monitoringStarted', 'monitoringStopped', 'appOpened', 'checkIn', 'interaction']
+        && request.resource.data.source == 'app_foreground'
+        && request.resource.data.timestamp == request.time
+        && (request.resource.data.profileId == null
+            || (profileExists(request.resource.data.profileId)
+                && isLinkedElder(request.resource.data.profileId)
+                && consent(request.resource.data.profileId, 'activity')
+                && request.resource.data.familyId == profile(request.resource.data.profileId).familyId));
+
+      allow update: if false; // records are immutable
+      allow delete: if signedIn() && resource.data.userId == uid();
+    }
+
+    // ---------- medical summaries ----------
+    match /medicalSummaries/{summaryId} {
+      allow read: if signedIn() && (
+        resource.data.userId == uid()
+        || (resource.data.get('sharedWithFamily', false) == true
+            && resource.data.profileId != null
+            && profileExists(resource.data.profileId)
+            && consent(resource.data.profileId, 'medical')
+            && (canCareFor(resource.data.profileId) || isLinkedElder(resource.data.profileId))));
+
+      allow create: if signedIn()
+        && request.resource.data.userId == uid()
+        && str(request.resource.data.title, 100)
+        && request.resource.data.summaryText is string && request.resource.data.summaryText.size() <= 20000
+        && request.resource.data.originalText is string && request.resource.data.originalText.size() <= 20000
+        && (request.resource.data.profileId == null
+            || (profileExists(request.resource.data.profileId)
+                && request.resource.data.familyId == profile(request.resource.data.profileId).familyId
+                && roleIn(request.resource.data.familyId, ['admin', 'caregiver', 'elderly'])));
+
+      allow update: if signedIn() && resource.data.userId == uid()
+        && onlyChanges(['title', 'summaryText', 'updatedAt', 'retentionStatus'])
+        && str(request.resource.data.title, 100)
+        && request.resource.data.summaryText.size() <= 20000;
+
+      allow delete: if signedIn() && resource.data.userId == uid();
+    }
+
+    // ---------- recordings (metadata; audio lives in Storage) ----------
+    match /recordings/{recordingId} {
+      allow read: if signedIn() && resource.data.userId == uid();
+      allow create: if signedIn()
+        && request.resource.data.userId == uid()
+        && request.resource.data.storageReference == 'recordings/' + uid() + '/' + recordingId + '.m4a'
+        && str(request.resource.data.consentReference, 200)
+        && request.resource.data.deletionStatus == 'active'
+        && request.resource.data.transcriptionStatus == 'uploaded';
+      allow update: if signedIn() && resource.data.userId == uid()
+        && onlyChanges(['deletionStatus', 'transcript', 'deletedAt'])
+        && request.resource.data.deletionStatus == 'deleted';
+      allow delete: if signedIn() && resource.data.userId == uid();
+    }
+
+    // ---------- scam checks (verdict only, never message text) ----------
+    match /scamChecks/{checkId} {
+      allow read, delete: if signedIn() && resource.data.userId == uid();
+      allow create: if signedIn()
+        && request.resource.data.userId == uid()
+        && request.resource.data.riskLevel in ['low', 'medium', 'high']
+        && request.resource.data.inputType in ['sms', 'whatsapp', 'email', 'url', 'payment']
+        && request.resource.data.aiUsed == false
+        // Whitelist: only the verdict fields the app writes. This rejects
+        // `text`, `message` and any other field that could carry message text.
+        && request.resource.data.keys().hasOnly(['userId', 'inputType', 'riskLevel',
+             'indicators', 'recommendations', 'aiUsed', 'createdAt'])
+        && (!('indicators' in request.resource.data) || request.resource.data.indicators is list)
+        && (!('recommendations' in request.resource.data) || request.resource.data.recommendations is list);
+      allow update: if false;
+    }
+
+    // ---------- reminders ----------
+    match /reminders/{reminderId} {
+      function canSeeReminder(r) {
+        return r.userId == uid()
+          || (r.get('profileId', null) != null && profileExists(r.profileId) && (
+                isLinkedElder(r.profileId)
+                || (consent(r.profileId, 'reminders')
+                    && (canCareFor(r.profileId) || roleIn(profile(r.profileId).familyId, ['viewer'])))));
+      }
+      function canManageReminder(r) {
+        return r.userId == uid()
+          || (r.get('profileId', null) != null && profileExists(r.profileId)
+              && consent(r.profileId, 'reminders') && canCareFor(r.profileId));
+      }
+
+      allow read: if signedIn() && canSeeReminder(resource.data);
+
+      // Creation goes through the remindersCreate function (validated
+      // server-side); direct client creation is limited to own reminders.
+      allow create: if signedIn()
+        && request.resource.data.userId == uid()
+        && request.resource.data.get('profileId', null) == null
+        && str(request.resource.data.title, 80);
+
+      allow update: if signedIn() && unchanged(['userId', 'profileId', 'familyId', 'createdAt']) && (
+        (canManageReminder(resource.data) && str(request.resource.data.title, 80))
+        // The linked elder can complete / snooze reminders made for them.
+        || (resource.data.get('profileId', null) != null && isLinkedElder(resource.data.profileId)
+            && onlyChanges(['completionStatus', 'nextDueAt', 'lastCompletedAt', 'notified', 'updatedAt']))
+      );
+
+      allow delete: if signedIn() && canManageReminder(resource.data);
+
+      match /history/{entryId} {
+        allow read: if signedIn() && canSeeReminder(get(/databases/$(database)/documents/reminders/$(reminderId)).data);
+        allow create: if signedIn()
+          && request.resource.data.by == uid()
+          && request.resource.data.action in ['completed', 'snoozed']
+          && (canManageReminder(get(/databases/$(database)/documents/reminders/$(reminderId)).data)
+              || isLinkedElder(get(/databases/$(database)/documents/reminders/$(reminderId)).data.profileId));
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- notifications (server-created) ----------
+    match /notifications/{notificationId} {
+      allow read: if signedIn() && resource.data.userId == uid();
+      allow update: if signedIn() && resource.data.userId == uid() && onlyChanges(['readStatus']);
+      allow delete: if signedIn() && resource.data.userId == uid();
+      allow create: if false;
+    }
+
+    // ---------- emergency contacts ----------
+    match /emergencyContacts/{contactId} {
+      function validContact(d) {
+        return str(d.contactName, 80) && str(d.relationship, 40) && str(d.phoneNumber, 25)
+          && d.phoneNumber.matches('^[+0-9 ()\\-]{7,25}$');
+      }
+      allow read: if signedIn() && (
+        resource.data.ownerId == uid()
+        || (resource.data.get('familyId', null) != null && isMember(resource.data.familyId)));
+      allow create: if signedIn() && request.resource.data.ownerId == uid() && validContact(request.resource.data)
+        && (request.resource.data.get('familyId', null) == null || roleIn(request.resource.data.familyId, ['admin', 'caregiver', 'elderly']));
+      allow update: if signedIn() && unchanged(['ownerId']) && validContact(request.resource.data) && (
+        resource.data.ownerId == uid()
+        || (resource.data.get('familyId', null) != null && roleIn(resource.data.familyId, ['admin', 'caregiver'])))
+        // Moving a contact into a family needs the same membership as creating
+        // one there (otherwise any editor could plant it in another family).
+        && (request.resource.data.get('familyId', null) == null
+            || request.resource.data.get('familyId', null) == resource.data.get('familyId', null)
+            || roleIn(request.resource.data.familyId, ['admin', 'caregiver', 'elderly']));
+      allow delete: if signedIn() && (
+        resource.data.ownerId == uid()
+        || (resource.data.get('familyId', null) != null && isAdmin(resource.data.familyId)));
+    }
+
+    // ---------- server-only ----------
+    match /rateLimits/{doc} { allow read, write: if false; }
+    match /auditLog/{doc} { allow read, write: if false; }
+
+    // Everything else is denied.
+    match /{document=**} { allow read, write: if false; }
+  }
+}

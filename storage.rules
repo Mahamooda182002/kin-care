@@ -1,0 +1,55 @@
+rules_version = '2';
+
+// Kin Care Connect — Cloud Storage rules.
+// Storage is used only where necessary: profile pictures and consented audio
+// recordings. Recordings are deleted automatically after 30 days by the
+// purgeExpiredData scheduled function.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() { return request.auth != null; }
+    function isOwner(userId) { return signedIn() && request.auth.uid == userId; }
+
+    // Profile pictures: owner writes; any signed-in user may read (shown to
+    // family members). Images only, max 5 MB.
+    match /profileImages/{userId}/{fileName} {
+      allow read: if signedIn();
+      allow write: if isOwner(userId)
+        && fileName.matches('avatar\\.(jpg|png)')
+        && request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png)');
+      allow delete: if isOwner(userId);
+    }
+
+    // Medical audio recordings: owner only. Audio only, max 25 MB
+    // (30 min at 64 kbps ≈ 15 MB). Never shared with family.
+    // Upload needs a matching consent record: the Firestore metadata doc
+    // recordings/{recordingId} (written first by the app, with the in-app
+    // consent reference) must belong to this user, point at this exact file,
+    // carry a consent reference and still be active.
+    function hasConsentRecord(userId, fileName) {
+      let recordingId = fileName.split('[.]')[0];
+      let path = /databases/(default)/documents/recordings/$(recordingId);
+      return firestore.exists(path)
+        && firestore.get(path).data.userId == userId
+        && firestore.get(path).data.storageReference == 'recordings/' + userId + '/' + fileName
+        && firestore.get(path).data.consentReference is string
+        && firestore.get(path).data.consentReference.size() > 0
+        && firestore.get(path).data.deletionStatus == 'active';
+    }
+
+    match /recordings/{userId}/{fileName} {
+      allow read, delete: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && fileName.matches('[A-Za-z0-9]+\\.m4a')
+        && request.resource.size < 25 * 1024 * 1024
+        && request.resource.contentType.matches('audio/.*')
+        && hasConsentRecord(userId, fileName);
+      allow update: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
